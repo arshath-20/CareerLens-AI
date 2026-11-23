@@ -1,4 +1,4 @@
-name: Deploy CareerLens AI frontend to S3
+name: Frontend CI/CD - AWS S3
 
 on:
   push:
@@ -11,17 +11,17 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
-  group: frontend-production-deploy
+  group: frontend-production-deployment
   cancel-in-progress: true
 
 jobs:
-  deploy:
-    name: Build and deploy frontend
+  build:
+    name: Build and validate React frontend
     runs-on: ubuntu-latest
-    environment: production
+    timeout-minutes: 15
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,7 +33,16 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Install dependencies
+      - name: Validate deployment configuration
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+        run: |
+          if [ -z "$VITE_API_BASE_URL" ]; then
+            echo "::error::Set the VITE_API_BASE_URL repository variable."
+            exit 1
+          fi
+
+      - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
 
@@ -41,37 +50,82 @@ jobs:
         working-directory: frontend
         env:
           VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
-        run: |
-          if [ -z "$VITE_API_BASE_URL" ]; then
-            echo "::error::Set the VITE_API_BASE_URL repository variable to your deployed backend URL."
-            exit 1
-          fi
-          npm run build
+        run: npm run build
 
-      - name: Configure AWS credentials (GitHub OIDC)
+      - name: Verify build output
+        run: |
+          test -s frontend/dist/index.html || {
+            echo "::error::frontend/dist/index.html was not generated."
+            exit 1
+          }
+
+      - name: Upload frontend build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy:
+    name: Deploy frontend to Amazon S3
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download frontend build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist/
+
+      - name: Validate AWS deployment variables
+        env:
+          AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_S3_BUCKET: ${{ vars.AWS_S3_BUCKET }}
+        run: |
+          test -n "$AWS_ROLE_TO_ASSUME" || {
+            echo "::error::Missing AWS_ROLE_TO_ASSUME repository variable."
+            exit 1
+          }
+          test -n "$AWS_REGION" || {
+            echo "::error::Missing AWS_REGION repository variable."
+            exit 1
+          }
+          test -n "$AWS_S3_BUCKET" || {
+            echo "::error::Missing AWS_S3_BUCKET repository variable."
+            exit 1
+          }
+
+      - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Verify deployment configuration
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Deploy static site to S3
         env:
           AWS_S3_BUCKET: ${{ vars.AWS_S3_BUCKET }}
-          AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME }}
-          AWS_REGION: ${{ vars.AWS_REGION }}
         run: |
-          test -n "$AWS_S3_BUCKET" || { echo "::error::Missing AWS_S3_BUCKET repository variable."; exit 1; }
-          test -n "$AWS_ROLE_TO_ASSUME" || { echo "::error::Missing AWS_ROLE_TO_ASSUME repository variable."; exit 1; }
-          test -n "$AWS_REGION" || { echo "::error::Missing AWS_REGION repository variable."; exit 1; }
-          aws sts get-caller-identity
+          aws s3 sync dist/ "s3://$AWS_S3_BUCKET/" \
+            --delete \
+            --no-progress
 
-      - name: Sync static site to S3
-        working-directory: frontend
+      - name: Verify uploaded homepage
         env:
           AWS_S3_BUCKET: ${{ vars.AWS_S3_BUCKET }}
-        run: aws s3 sync dist/ "s3://$AWS_S3_BUCKET/" --delete --no-progress
+        run: |
+          aws s3api head-object \
+            --bucket "$AWS_S3_BUCKET" \
+            --key index.html
 
-      - name: Verify uploaded entry point
-        env:
-          AWS_S3_BUCKET: ${{ vars.AWS_S3_BUCKET }}
-        run: aws s3api head-object --bucket "$AWS_S3_BUCKET" --key index.html
