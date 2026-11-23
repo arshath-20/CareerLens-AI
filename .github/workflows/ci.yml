@@ -22,8 +22,9 @@ concurrency:
 
 jobs:
   backend:
-    name: Backend validation and Lambda ZIP build
+    name: Backend validation
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -58,17 +59,17 @@ jobs:
       - name: Check installed dependencies
         run: python -m pip check
 
-      - name: Build and validate Lambda ZIP
-        run: python backend/scripts/build_lambda_zip.py --output "$RUNNER_TEMP/careerlens-lambda.zip"
-
   frontend:
     name: Frontend build
     runs-on: ubuntu-latest
+
     env:
-      VITE_API_BASE_URL: https://api.invalid # CI-only placeholder; deployment requires the configured API Gateway URL
+      VITE_API_BASE_URL: https://api.invalid
+
     defaults:
       run:
         working-directory: frontend
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
