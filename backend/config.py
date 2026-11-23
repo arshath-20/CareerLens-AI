@@ -14,4 +14,5 @@ AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-2").strip()
 S3_RESUME_BUCKET = os.getenv(
     "S3_RESUME_BUCKET", "careerlens-ai-resumes-unique-suffix"
 ).strip()
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
 PORT = int(os.getenv("PORT", 8000))

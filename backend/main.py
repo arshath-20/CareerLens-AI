@@ -1,4 +1,4 @@
-import uuid
+﻿import uuid
 import shutil
 import logging
 from datetime import datetime
@@ -13,10 +13,12 @@ from mangum import Mangum
 
 from config import GROQ_API_KEY, GROQ_MODEL, PORT
 from database import (
-    connect_db, get_db, save_evaluation, get_evaluations_by_user,
+    DatabaseUnavailable, get_db,
     create_user, authenticate_user, get_user_by_token,
     save_chat_message, get_chat_history, clear_chat_history,
-    save_full_evaluation, get_user_evaluations, get_user_evaluation_detail, delete_user_evaluation
+    save_full_evaluation, get_user_evaluations, get_user_evaluation_detail,
+    delete_user_evaluation, get_resume_session, save_resume_session,
+    update_evaluation_context
 )
 from services.groq_service import is_groq_configured
 from services.resume_parser import extract_text_from_pdf
@@ -69,6 +71,11 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
+@app.exception_handler(DatabaseUnavailable)
+async def database_unavailable_handler(request: Request, exc: DatabaseUnavailable):
+    logger.error("Database unavailable while handling %s", request.url.path)
+    return JSONResponse(status_code=503, content={"detail": "Database service is temporarily unavailable."})
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Global unhandled exception on {request.url.path}: {exc}", exc_info=True)
@@ -87,8 +94,35 @@ async def global_exception_handler(request: Request, exc: Exception):
 UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# In-memory sessions cache for quick access
-active_sessions: Dict[str, Dict[str, Any]] = {}
+def _authenticated_user(authorization: Optional[str], required: bool = False):
+    token = None
+    if authorization:
+        if not authorization.startswith("Bearer "):
+            if required:
+                raise HTTPException(status_code=401, detail="Authentication required.")
+        else:
+            token = authorization.split("Bearer ", 1)[1].strip()
+    if not token:
+        if required:
+            raise HTTPException(status_code=401, detail="Authentication required.")
+        return None
+    user = get_user_by_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired session token.")
+    return user
+
+
+def _resume_owner(session_id: str, authorization: Optional[str]):
+    user = _authenticated_user(authorization)
+    return user["id"] if user else f"anonymous:{session_id}"
+
+
+def _owned_evaluation(evaluation_id: str, authorization: Optional[str]):
+    user = _authenticated_user(authorization, required=True)
+    analysis = get_user_evaluation_detail(user["id"], evaluation_id)
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Evaluation report not found.")
+    return user, analysis, analysis.get("evaluation_id") or evaluation_id
 
 @app.get("/")
 def root():
@@ -144,6 +178,8 @@ def register(payload: RegisterRequest):
         return create_user(payload.name, payload.email, payload.password)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except DatabaseUnavailable:
+        raise
     except Exception as e:
         logger.error(f"Registration error: {e}")
         raise HTTPException(status_code=500, detail="Failed to create user account.")
@@ -156,6 +192,8 @@ def login(payload: LoginRequest):
         return authenticate_user(payload.email, payload.password)
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
+    except DatabaseUnavailable:
+        raise
     except Exception as e:
         logger.error(f"Login error: {e}")
         raise HTTPException(status_code=500, detail="Login service error.")
@@ -175,7 +213,10 @@ def get_current_user(authorization: Optional[str] = Header(None)):
 # ----------------- RESUME ENDPOINTS -----------------
 
 @app.post("/api/resume/upload")
-async def upload_resume(file: UploadFile = File(...)):
+async def upload_resume(
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+):
     """
     Accepts PDF resume upload, extracts text with layout preservation,
     and returns session identifier + preliminary document stats.
@@ -198,13 +239,14 @@ async def upload_resume(file: UploadFile = File(...)):
                 detail="Unable to extract text from this PDF. Please ensure it is not a scanned image without OCR."
             )
 
-        active_sessions[session_id] = {
-            "session_id": session_id,
-            "filename": file.filename,
-            "raw_text": extracted_text,
-            "metadata": metadata,
-            "uploaded_at": datetime.utcnow().isoformat()
-        }
+        owner_id = _resume_owner(session_id, authorization)
+        save_resume_session(
+            user_id=owner_id,
+            session_id=session_id,
+            raw_text=extracted_text,
+            metadata=metadata,
+            filename=file.filename,
+        )
 
         return {
             "session_id": session_id,
@@ -215,17 +257,23 @@ async def upload_resume(file: UploadFile = File(...)):
         }
     except HTTPException:
         raise
+    except DatabaseUnavailable:
+        raise
     except Exception as e:
         logger.error(f"Error processing upload: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
 
 
 @app.post("/api/resume/analyze")
-async def analyze_resume(session_id: str = Form(...)):
+async def analyze_resume(
+    session_id: str = Form(...),
+    authorization: Optional[str] = Header(None),
+):
     """
     Runs precision structured extraction (Groq LLM) + ATS score calculator + Job matching.
     """
-    session = active_sessions.get(session_id)
+    owner_id = _resume_owner(session_id, authorization)
+    session = get_resume_session(session_id, owner_id)
     if not session or not session.get("raw_text"):
         raise HTTPException(status_code=404, detail="Session not found. Please upload a resume first.")
 
@@ -250,9 +298,18 @@ async def analyze_resume(session_id: str = Form(...)):
             "job_matches": job_matches[:8]
         }
 
-        # Store analysis back in session
-        session["analysis"] = result
+        save_resume_session(
+            user_id=owner_id,
+            session_id=session_id,
+            raw_text=raw_text,
+            metadata=session.get("metadata", {}),
+            filename=session.get("filename", ""),
+            s3_object_key=session.get("s3_object_key"),
+            analysis=result,
+        )
         return result
+    except DatabaseUnavailable:
+        raise
     except Exception as e:
         logger.error(f"Analysis error: {e}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
@@ -342,6 +399,7 @@ async def evaluate_unified_profile(
     raw_text = ""
     metadata = {}
     current_session_id = session_id or str(uuid.uuid4())
+    owner_id = _resume_owner(current_session_id, authorization)
 
     # 1. Process Resume if provided
     if file and getattr(file, "filename", None):
@@ -350,13 +408,26 @@ async def evaluate_unified_profile(
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
             raw_text, metadata = extract_text_from_pdf(str(file_path))
+            if raw_text:
+                save_resume_session(
+                    user_id=owner_id,
+                    session_id=current_session_id,
+                    raw_text=raw_text,
+                    metadata=metadata,
+                    filename=file.filename,
+                )
+        except DatabaseUnavailable:
+            raise
         except Exception as e:
             logger.error(f"Failed to extract text from PDF: {e}")
             raw_text = ""
             metadata = {"error": str(e)}
-    elif session_id and session_id in active_sessions:
-        raw_text = active_sessions[session_id].get("raw_text", "")
-        metadata = active_sessions[session_id].get("metadata", {})
+    elif session_id:
+        resume_session = get_resume_session(session_id, owner_id)
+        if not resume_session:
+            raise HTTPException(status_code=404, detail="Resume session not found.")
+        raw_text = resume_session.get("raw_text", "")
+        metadata = resume_session.get("metadata", {})
 
     # Extract resume profile if text exists
     resume_analysis = {}
@@ -469,6 +540,7 @@ async def evaluate_unified_profile(
     response_payload = {
         "evaluation_id": str(uuid.uuid4()),
         "created_at": datetime.utcnow().isoformat(),
+        "resume_session_id": current_session_id if raw_text else None,
         "candidate_info": resume_analysis.get("candidate_info", {
             "name": effective_github or leetcode_username or "Candidate",
             "github": effective_github
@@ -546,24 +618,8 @@ async def evaluate_unified_profile(
         logger.error(f"Error generating roadmap: {e}")
         response_payload["roadmap"] = None
 
-    # Resolve user_id if token provided
-    user_id = "guest"
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.split("Bearer ", 1)[1].strip()
-        user = get_user_by_token(token)
-        if user:
-            user_id = user["id"]
+    save_full_evaluation(user_id=owner_id, record=response_payload)
 
-    # Save complete 360° evaluation record to MongoDB tagged with user_id
-    save_full_evaluation(user_id=user_id, record=response_payload)
-
-    # Cache for chat copilot & custom JD matchers
-    active_sessions[response_payload["evaluation_id"]] = {
-        "analysis": response_payload
-    }
-    active_sessions["latest"] = {
-        "analysis": response_payload
-    }
 
     return response_payload
 
@@ -574,17 +630,14 @@ async def evaluate_unified_profile(
 async def match_custom_job_description(
     evaluation_id: Optional[str] = Form("latest"),
     jd_text: Optional[str] = Form(None),
-    jd_file: Optional[UploadFile] = File(None)
+    jd_file: Optional[UploadFile] = File(None),
+    authorization: Optional[str] = Header(None),
 ):
     """
     Matches the candidate's existing evaluated profile against a custom Job Description
     provided as text or a PDF document.
     """
-    eval_id = evaluation_id or "latest"
-    session_data = active_sessions.get(eval_id) or active_sessions.get("latest") or {}
-    context = session_data.get("analysis", {})
-    if not context:
-        raise HTTPException(status_code=404, detail="No evaluation found. Please evaluate a profile or upload a resume first.")
+    user, context, actual_eval_id = _owned_evaluation(evaluation_id or "latest", authorization)
 
     effective_jd_text = ""
     if jd_file and jd_file.filename:
@@ -622,11 +675,19 @@ async def match_custom_job_description(
         context["custom_jd_match"] = match_result
         if match_result.get("job_title"):
             context["target_role"] = match_result["job_title"]
+        updates = {"custom_jd_match": match_result}
+        if context.get("target_role"):
+            updates["target_role"] = context["target_role"]
+        update_evaluation_context(
+            user["id"], actual_eval_id, updates,
+        )
 
         return {
             "success": True,
             "custom_jd_match": match_result
         }
+    except DatabaseUnavailable:
+        raise
     except Exception as e:
         logger.error(f"Failed to match candidate against custom JD: {e}")
         raise HTTPException(status_code=500, detail=f"JD match analysis failed: {str(e)}")
@@ -636,30 +697,30 @@ class DynamicRoadmapRequest(BaseModel):
     target_role: str
 
 @app.post("/api/roadmap/generate")
-def generate_custom_role_roadmap(payload: DynamicRoadmapRequest):
-    eval_id = payload.evaluation_id or "latest"
-    session_data = active_sessions.get(eval_id) or active_sessions.get("latest") or {}
-    context = session_data.get("analysis", {})
-    if not context:
-        raise HTTPException(status_code=404, detail="No evaluation found. Please evaluate profile first.")
-    
+def generate_custom_role_roadmap(
+    payload: DynamicRoadmapRequest,
+    authorization: Optional[str] = Header(None),
+):
+    user, context, actual_eval_id = _owned_evaluation(payload.evaluation_id or "latest", authorization)
     new_roadmap = generate_personalized_roadmap(context, target_role=payload.target_role)
     context["roadmap"] = new_roadmap
     context["target_role"] = payload.target_role
+    update_evaluation_context(user["id"], actual_eval_id, {"roadmap": new_roadmap, "target_role": payload.target_role})
     return new_roadmap
 
 @app.get("/api/roadmap/{evaluation_id}")
-def get_evaluation_roadmap(evaluation_id: str = "latest"):
-    session_data = active_sessions.get(evaluation_id) or active_sessions.get("latest") or {}
-    context = session_data.get("analysis", {})
-    if not context:
-        raise HTTPException(status_code=404, detail="No evaluation found. Please evaluate profile first.")
+def get_evaluation_roadmap(
+    evaluation_id: str = "latest",
+    authorization: Optional[str] = Header(None),
+):
+    user, context, actual_eval_id = _owned_evaluation(evaluation_id, authorization)
     
     if "roadmap" in context and context["roadmap"]:
         return context["roadmap"]
     
     roadmap = generate_personalized_roadmap(context)
     context["roadmap"] = roadmap
+    update_evaluation_context(user["id"], actual_eval_id, {"roadmap": roadmap})
     return roadmap
 
 
@@ -682,18 +743,8 @@ async def copilot_chat(
     if not msg:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
-    eval_id = payload.evaluation_id or "latest"
-    session_data = active_sessions.get(eval_id) or active_sessions.get("latest") or {}
-    context = session_data.get("analysis", {})
-
-    # Extract user identity from auth token
-    user = None
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.split("Bearer ", 1)[1].strip()
-        user = get_user_by_token(token)
-
-    # Use authenticated user id or fallback to eval_id
-    user_id = user["id"] if user else (eval_id or "guest")
+    user, context, eval_id = _owned_evaluation(payload.evaluation_id or "latest", authorization)
+    user_id = user["id"]
 
     # Load stored conversation history for this specific user
     stored_msgs = get_chat_history(user_id, limit=30, evaluation_id=eval_id)
@@ -719,7 +770,7 @@ async def copilot_chat(
     save_chat_message(user_id=user_id, role="assistant", content=reply, evaluation_id=eval_id)
 
     # Return reply along with updated user-specific history
-    updated_history = get_chat_history(user_id, limit=50)
+    updated_history = get_chat_history(user_id, limit=50, evaluation_id=eval_id)
 
     return {
         "reply": reply,
@@ -735,15 +786,10 @@ async def fetch_chat_history(
     """
     Retrieve user-isolated conversation history from MongoDB.
     """
-    user = None
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.split("Bearer ", 1)[1].strip()
-        user = get_user_by_token(token)
-
-    user_id = user["id"] if user else (evaluation_id or "guest")
-    messages = get_chat_history(user_id, limit=50, evaluation_id=evaluation_id)
+    user, _, actual_eval_id = _owned_evaluation(evaluation_id or "latest", authorization)
+    messages = get_chat_history(user["id"], limit=50, evaluation_id=actual_eval_id)
     return {
-        "user_id": user_id,
+        "user_id": user["id"],
         "history": messages
     }
 
@@ -755,13 +801,8 @@ async def clear_user_chat_history(
     """
     Clear conversation history for the current user in MongoDB.
     """
-    user = None
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.split("Bearer ", 1)[1].strip()
-        user = get_user_by_token(token)
-
-    user_id = user["id"] if user else (evaluation_id or "guest")
-    success = clear_chat_history(user_id, evaluation_id=evaluation_id)
+    user, _, actual_eval_id = _owned_evaluation(evaluation_id or "latest", authorization)
+    success = clear_chat_history(user["id"], evaluation_id=actual_eval_id)
     return {
         "success": success,
         "message": "Conversation history cleared successfully."
@@ -799,26 +840,10 @@ async def fetch_evaluation_detail(
     """
     Retrieve complete 360° analysis detail for a specific past evaluation to restore the dashboard.
     """
-    user_id = "guest"
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.split("Bearer ", 1)[1].strip()
-        user = get_user_by_token(token)
-        if user:
-            user_id = user["id"]
-
-    analysis = get_user_evaluation_detail(user_id=user_id, evaluation_id=evaluation_id)
-    if not analysis:
-        # Fallback to in-memory active_sessions if exists
-        sess = active_sessions.get(evaluation_id)
-        if sess and sess.get("analysis"):
-            analysis = sess["analysis"]
-
+    user = _authenticated_user(authorization, required=True)
+    analysis = get_user_evaluation_detail(user_id=user["id"], evaluation_id=evaluation_id)
     if not analysis:
         raise HTTPException(status_code=404, detail="Evaluation report not found.")
-
-    # Re-cache in active_sessions so copilot chat & custom JD matching work on this restored report
-    active_sessions[evaluation_id] = {"analysis": analysis}
-    active_sessions["latest"] = {"analysis": analysis}
 
     return {
         "evaluation_id": evaluation_id,
@@ -852,19 +877,14 @@ async def remove_user_evaluation(
 
 # Backward compatibility endpoints for Devlyzer & Resume-AI components
 @app.get("/evaluations/{github}")
-def get_evaluations_legacy(github: str):
-    return get_evaluations_by_user(github)
+def get_evaluations_legacy(github: str, authorization: Optional[str] = Header(None)):
+    user = _authenticated_user(authorization, required=True)
+    return get_user_evaluations(user_id=user["id"])
 
 @app.get("/devlens-evaluate/{github}/{leetcode}")
 def devlens_legacy(github: str, leetcode: str):
     return evaluate_unified_profile(github_username=github, leetcode_username=leetcode)
 
-
-# Initialize process-scoped clients once when a Lambda execution environment
-# starts. Module globals are reused by warm invocations; local Uvicorn uses the
-# same initialization path. Database reliability/fallback behavior is handled
-# in the database implementation phase.
-connect_db()
 
 # AWS Lambda entry point. Mangum adapts API Gateway/Lambda events to ASGI.
 handler = Mangum(app)

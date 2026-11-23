@@ -72,7 +72,7 @@ Inspect the repository and establish a verified baseline and migration sequence 
 | ------ | -------------- | ------ |
 | 01 | Repository audit | Completed |
 | 02 | Backend Lambda compatibility | Partially Completed |
-| 03 | MongoDB reliability and persistence | Pending |
+| 03 | MongoDB reliability and persistence | Partially Completed — Unit Tests Passed; Atlas Integration Pending |
 | 04 | S3 resume storage | Pending |
 | 05 | Resume upload integration | Pending |
 | 06 | Asynchronous evaluation workflow | Pending |
@@ -145,4 +145,75 @@ Adapt the FastAPI backend for AWS Lambda through Mangum, retain local Uvicorn op
 - The existing `.env` loader remains for local development. Environment variables supplied by Lambda remain supported because `load_dotenv` does not override already-set process variables by default.
 - No S3 storage, asynchronous evaluation, frontend migration, or AWS deployment was performed.
 
+
+
+
+---
+
+## Implementation 03 — MongoDB Reliability & Persistence
+
+### Status
+Partially Completed — Unit Tests Passed; Atlas Integration Pending
+
+### Objective
+Make MongoDB connections lazy and reusable, fail safely when durable production storage is unavailable, secure owner-scoped evaluation retrieval, and persist resume sessions and evaluation context beyond a Lambda execution environment.
+
+### Files Created
+- backend/test_database_persistence.py — mocked unit tests for connection reuse, production fail-closed behavior, persistence, and ownership isolation.
+
+### Files Modified
+- backend/database.py — added lazy locked connection initialization, timeouts, connection reuse and retry backoff; production failure handling; scoped MongoDB persistence and indexes for resumes, evaluations, users, and conversations; removed in-memory fallbacks after operation failures; fixed evaluation ownership queries.
+- backend/main.py — removed import-time database initialization and active_sessions; persisted resume sessions and evaluations; loads evaluation context from MongoDB using the authenticated owner for JD matching, roadmaps, chat, history, and evaluation detail; removed global latest context; added controlled 503 database errors.
+- backend/config.py — added APP_ENV configuration for strict production behavior.
+- backend/.env.example — documented local development memory fallback and production behavior.
+- implementation.md — recorded the actual phase status and results.
+
+### Files Removed
+- None.
+
+### Changes Implemented
+- MongoDB initialization occurs on first database use rather than during application import. A single process-scoped MongoClient is reused across requests and warm Lambda invocations; it is not closed per request.
+- Set serverSelectionTimeoutMS=3000, connectTimeoutMS=3000, and socketTimeoutMS=5000. Failed production connection attempts are retried no more often than once per five seconds.
+- Production mode is enabled by APP_ENV=production/prod or Lambda's AWS_LAMBDA_FUNCTION_NAME. Missing or unavailable MongoDB raises DatabaseUnavailable, mapped to a generic HTTP 503 response. Configured MongoDB operation failures also raise instead of silently writing to memory.
+- Local development retains the prior in-memory behavior when MongoDB is not configured or its initial connection fails, with an explicit warning. An operation failure after a successful MongoDB connection is surfaced rather than falling back.
+- Evaluation detail queries always include the owning user_id; missing identity and invalid IDs return no record. The latest identifier resolves to the latest evaluation for that authenticated user only.
+- Added MongoDB persistence for resume session ID, owner, extracted text, metadata, filename, optional S3 object key, optional analysis, and UTC creation/update timestamps. PDF bytes are not stored.
+- Evaluation records retain the complete analysis context. JD match and roadmap updates are persisted; chat history is queried and written with both authenticated user and evaluation IDs.
+- Removed all active_sessions use in backend/main.py, including the global latest cache. The legacy evaluation-history route now returns the authenticated user's records.
+- Added indexes for unique user email/token, user/date evaluation listing, user/evaluation ownership, user/evaluation/timestamp conversation access, and owner-scoped resume lookup/update.
+
+### Dependencies
+- No dependencies added, removed, or updated.
+
+### Tests Performed
+- python -m compileall -q . from backend, using Python 3.12.10.
+- python -m unittest -v test_database_persistence from backend, using Python 3.12.10.
+- rg source inspection for active_sessions and RENDER_EXTERNAL_URL in backend/main.py.
+- git diff --check for the phase application files.
+
+### Test Results
+- Compilation completed successfully.
+- All 11 database persistence unit tests passed with no failures or errors.
+- Expected MongoDB OSError messages appeared in tests simulating connection and write failures.
+- Static source search confirmed active_sessions and RENDER_EXTERNAL_URL are absent from backend/main.py.
+- git diff --check passed.
+- Atlas integration tests were not run and remain pending. End-to-end validation and local filesystem resume migration to private S3 remain pending. No AWS deployment was performed.
+
+### Configuration Required
+- Set APP_ENV=production for production deployments outside Lambda. Lambda is identified through its runtime environment and automatically uses strict database behavior.
+- Configure MONGO_URI in the production runtime. Never record its value in this log.
+- Local development can keep APP_ENV=development; if MongoDB is not configured or unavailable during initial connection, the historical in-memory mode remains enabled and is logged.
+- No AWS deployment was performed.
+
+### Pending Work
+- Run controlled MongoDB Atlas integration checks when a safe test database is available.
+- Validate the existing application flows end to end.
+- Review remaining local filesystem resume PDF handling; the PDF is still written under backend/uploads. Move it to private S3 in Implementations 04/05.
+- Implementations 04–10 remain pending.
+
+### Important Notes
+- memory_store remains in backend/database.py only for local development when initial MongoDB setup is absent/unavailable; production never selects that fallback. This preserves the documented local behavior in backend/.env.example.
+- The new unit tests use mocked collections and a mocked MongoClient; they do not require or print production MongoDB credentials.
+- The resume parser and frontend/workflow files were not modified in Implementation 03. No S3 storage, asynchronous evaluation, frontend migration, or AWS deployment was performed.
+- Implementation 02 remains documented as Partially Completed; its Lambda event compatibility test is still outstanding.
 
