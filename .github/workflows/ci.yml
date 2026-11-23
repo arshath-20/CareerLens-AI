@@ -2,9 +2,15 @@ name: CareerLens AI CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - production
+      - "feature/**"
+      - "fix/**"
   pull_request:
-    branches: [main]
+    branches:
+      - main
+      - production
   workflow_dispatch:
 
 permissions:
@@ -37,11 +43,11 @@ jobs:
       - name: Check Python syntax
         run: python -m compileall -q backend
 
-      - name: Smoke-test FastAPI application
+      - name: Smoke-test backend services
         working-directory: backend
         env:
           PYTHONPATH: .
-        run: python -c "from main import app; assert app.title; print('FastAPI application import passed')"
+        run: python test_backend.py
 
       - name: Check installed dependencies
         run: python -m pip check
