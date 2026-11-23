@@ -1,4 +1,3 @@
-import os
 import uuid
 import shutil
 import logging
@@ -10,6 +9,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Body,
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from mangum import Mangum
 
 from config import GROQ_API_KEY, GROQ_MODEL, PORT
 from database import (
@@ -89,27 +89,6 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 # In-memory sessions cache for quick access
 active_sessions: Dict[str, Dict[str, Any]] = {}
-
-def _keep_alive_ping_worker():
-    """Background daemon that pings the Render backend every 10 minutes to prevent sleep."""
-    import time
-    time.sleep(60)  # Wait 1 minute after boot
-    render_url = os.getenv("RENDER_EXTERNAL_URL") or "https://devlyzer-ai.onrender.com"
-    while True:
-        try:
-            import requests
-            resp = requests.get(f"{render_url}/api/health", timeout=25)
-            logger.info(f"10-Minute Keep-Alive Heartbeat sent to {render_url} (HTTP {resp.status_code})")
-        except Exception as e:
-            logger.warning(f"Keep-alive ping note: {e}")
-        time.sleep(600)  # Exactly every 10 minutes
-
-@app.on_event("startup")
-def startup_event():
-    logger.info("Initializing Devlyzer AI backend...")
-    connect_db()
-    import threading
-    threading.Thread(target=_keep_alive_ping_worker, daemon=True).start()
 
 @app.get("/")
 def root():
@@ -880,6 +859,15 @@ def get_evaluations_legacy(github: str):
 def devlens_legacy(github: str, leetcode: str):
     return evaluate_unified_profile(github_username=github, leetcode_username=leetcode)
 
+
+# Initialize process-scoped clients once when a Lambda execution environment
+# starts. Module globals are reused by warm invocations; local Uvicorn uses the
+# same initialization path. Database reliability/fallback behavior is handled
+# in the database implementation phase.
+connect_db()
+
+# AWS Lambda entry point. Mangum adapts API Gateway/Lambda events to ASGI.
+handler = Mangum(app)
 
 if __name__ == "__main__":
     import uvicorn

@@ -10,4 +10,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-2").strip()
+S3_RESUME_BUCKET = os.getenv(
+    "S3_RESUME_BUCKET", "careerlens-ai-resumes-unique-suffix"
+).strip()
 PORT = int(os.getenv("PORT", 8000))
