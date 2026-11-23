@@ -1,4 +1,4 @@
-"""MongoDB persistence with process-scoped connection reuse.
+﻿"""MongoDB persistence with process-scoped connection reuse.
 
 Local development without MongoDB retains the historical in-memory behavior.
 Production (including Lambda) fails closed when MongoDB is unavailable.
@@ -11,7 +11,7 @@ import secrets
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from config import APP_ENV, MONGO_URI
 
@@ -20,6 +20,7 @@ logger = logging.getLogger("careerlens.database")
 client = None
 db = None
 _connection_lock = threading.Lock()
+_evaluation_jobs_lock = threading.Lock()
 _connection_attempted = False
 _last_connection_error = None
 _retry_after = 0.0
@@ -35,6 +36,7 @@ memory_store = {
     "resumes": {},
     "users": {},
     "conversations": {},
+    "evaluation_jobs": {},
 }
 
 
@@ -56,6 +58,14 @@ def _ensure_indexes(database):
     )
     database.resumes.create_index([("user_id", 1), ("id", 1)], unique=True)
     database.resumes.create_index([("user_id", 1), ("updated_at", -1)])
+    evaluation_jobs = getattr(database, "evaluation_jobs", None)
+    if evaluation_jobs is not None:
+        evaluation_jobs.create_index("id", unique=True)
+        evaluation_jobs.create_index([("user_id", 1), ("created_at", -1)])
+        evaluation_jobs.create_index(
+            [("user_id", 1), ("idempotency_key", 1)], unique=True,
+            partialFilterExpression={"idempotency_key": {"$type": "string"}},
+        )
 
 
 def connect_db():
@@ -278,19 +288,25 @@ def save_resume_session(
     filename: str = "",
     s3_object_key: str = None,
     analysis: dict = None,
+    content_type: str = None,
+    file_size: int = None,
+    uploaded_at: str = None,
 ):
     _require_user(user_id)
     now = _now()
-    existing = get_resume_session(session_id, user_id)
+    existing = get_resume_session(session_id, user_id) or {}
     doc = {
         "id": session_id,
         "user_id": user_id,
-        "filename": filename,
+        "filename": filename or existing.get("filename", ""),
         "raw_text": raw_text,
         "metadata": metadata or {},
-        "s3_object_key": s3_object_key,
-        "analysis": analysis,
-        "created_at": (existing or {}).get("created_at", now),
+        "s3_object_key": s3_object_key or existing.get("s3_object_key"),
+        "content_type": content_type or existing.get("content_type"),
+        "file_size": file_size if file_size is not None else existing.get("file_size"),
+        "uploaded_at": uploaded_at or existing.get("uploaded_at"),
+        "analysis": analysis if analysis is not None else existing.get("analysis"),
+        "created_at": existing.get("created_at", now),
         "updated_at": now,
     }
     database = _storage()
@@ -319,6 +335,186 @@ def get_resume_session(session_id: str, user_id: str):
             _operation_failed("get resume session", exc)
     return memory_store["resumes"].get((user_id, session_id))
 
+
+def create_evaluation_job(job: dict):
+    """Persist a new owner-scoped evaluation job before queue submission."""
+    user_id = job.get("user_id")
+    job_id = job.get("id")
+    _require_user(user_id)
+    if not job_id:
+        raise ValueError("An evaluation job ID is required.")
+    doc = dict(job)
+    now = _now()
+    doc.setdefault("status", "pending")
+    doc.setdefault("attempts", 0)
+    doc.setdefault("created_at", now)
+    doc.setdefault("updated_at", now)
+    database = _storage()
+    if database is not None:
+        try:
+            database.evaluation_jobs.insert_one(doc.copy())
+        except Exception as exc:
+            if doc.get("idempotency_key") and type(exc).__name__ == "DuplicateKeyError":
+                existing = database.evaluation_jobs.find_one(
+                    {"user_id": user_id, "idempotency_key": doc["idempotency_key"]},
+                    {"_id": 0},
+                )
+                if existing:
+                    return existing
+            _operation_failed("create evaluation job", exc)
+    else:
+        with _evaluation_jobs_lock:
+            if doc.get("idempotency_key"):
+                existing = next((
+                    saved.copy() for saved in memory_store["evaluation_jobs"].values()
+                    if saved.get("user_id") == user_id
+                    and saved.get("idempotency_key") == doc["idempotency_key"]
+                ), None)
+                if existing:
+                    return existing
+            if job_id in memory_store["evaluation_jobs"]:
+                raise ValueError("Evaluation job ID already exists.")
+            memory_store["evaluation_jobs"][job_id] = doc.copy()
+    return doc
+
+
+def get_evaluation_job(user_id: str, job_id: str):
+    if not user_id or not job_id:
+        return None
+    database = _storage()
+    if database is not None:
+        try:
+            return database.evaluation_jobs.find_one(
+                {"id": job_id, "user_id": user_id}, {"_id": 0}
+            )
+        except Exception as exc:
+            _operation_failed("get evaluation job", exc)
+    with _evaluation_jobs_lock:
+        job = memory_store["evaluation_jobs"].get(job_id)
+        return job.copy() if job and job.get("user_id") == user_id else None
+
+
+def get_evaluation_job_by_id(job_id: str):
+    """Internal worker lookup; never use this for an HTTP response."""
+    if not job_id:
+        return None
+    database = _storage()
+    if database is not None:
+        try:
+            return database.evaluation_jobs.find_one({"id": job_id}, {"_id": 0})
+        except Exception as exc:
+            _operation_failed("get evaluation job for worker", exc)
+    with _evaluation_jobs_lock:
+        job = memory_store["evaluation_jobs"].get(job_id)
+        return job.copy() if job else None
+
+
+def get_evaluation_job_by_idempotency_key(user_id: str, idempotency_key: str):
+    if not user_id or not idempotency_key:
+        return None
+    database = _storage()
+    if database is not None:
+        try:
+            return database.evaluation_jobs.find_one(
+                {"user_id": user_id, "idempotency_key": idempotency_key}, {"_id": 0}
+            )
+        except Exception as exc:
+            _operation_failed("get evaluation job idempotency key", exc)
+    with _evaluation_jobs_lock:
+        return next((job.copy() for job in memory_store["evaluation_jobs"].values()
+                     if job.get("user_id") == user_id
+                     and job.get("idempotency_key") == idempotency_key), None)
+
+def update_evaluation_job(job_id: str, updates: dict, user_id: str = None):
+    if not job_id or not updates:
+        return False
+    values = dict(updates)
+    values["updated_at"] = _now()
+    query = {"id": job_id}
+    if user_id:
+        query["user_id"] = user_id
+    database = _storage()
+    if database is not None:
+        try:
+            result = database.evaluation_jobs.update_one(query, {"$set": values})
+            return result.matched_count > 0
+        except Exception as exc:
+            _operation_failed("update evaluation job", exc)
+    with _evaluation_jobs_lock:
+        job = memory_store["evaluation_jobs"].get(job_id)
+        if not job or (user_id and job.get("user_id") != user_id):
+            return False
+        job.update(values)
+        return True
+
+
+def claim_evaluation_job(job_id: str, max_attempts: int = 3, lease_seconds: int = 1200):
+    """Atomically claim pending or expired jobs, incrementing the attempt count."""
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    lease_iso = (now + timedelta(seconds=lease_seconds)).isoformat()
+    database = _storage()
+    if database is not None:
+        try:
+            from pymongo import ReturnDocument
+
+            database.evaluation_jobs.update_one(
+                {
+                    "id": job_id,
+                    "attempts": {"$gte": max_attempts},
+                    "$or": [
+                        {"status": "pending"},
+                        {"status": "processing", "lease_expires_at": {"$lte": now_iso}},
+                    ],
+                },
+                {"$set": {"status": "failed", "failure_code": "evaluation_failed",
+                          "lease_expires_at": None, "updated_at": now_iso}},
+            )
+            return database.evaluation_jobs.find_one_and_update(
+                {
+                    "id": job_id,
+                    "attempts": {"$lt": max_attempts},
+                    "$or": [
+                        {"status": "pending"},
+                        {"status": "processing", "lease_expires_at": {"$lte": now_iso}},
+                    ],
+                },
+                {
+                    "$set": {
+                        "status": "processing",
+                        "started_at": now_iso,
+                        "lease_expires_at": lease_iso,
+                        "updated_at": now_iso,
+                    },
+                    "$inc": {"attempts": 1},
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception as exc:
+            _operation_failed("claim evaluation job", exc)
+    with _evaluation_jobs_lock:
+        job = memory_store["evaluation_jobs"].get(job_id)
+        if not job:
+            return None
+        expired = (
+            job.get("status") == "processing"
+            and job.get("lease_expires_at", "") <= now_iso
+        )
+        eligible = job.get("status") == "pending" or expired
+        if not eligible:
+            return None
+        if job.get("attempts", 0) >= max_attempts:
+            job.update({"status": "failed", "failure_code": "evaluation_failed",
+                        "lease_expires_at": None, "updated_at": now_iso})
+            return None
+        job.update({
+            "status": "processing",
+            "started_at": now_iso,
+            "lease_expires_at": lease_iso,
+            "updated_at": now_iso,
+            "attempts": job.get("attempts", 0) + 1,
+        })
+        return job.copy()
 
 def save_full_evaluation(user_id: str, record: dict):
     _require_user(user_id)

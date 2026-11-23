@@ -1,23 +1,32 @@
 ﻿import uuid
+import hashlib
 import shutil
 import logging
 from datetime import datetime
+import os
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Body, Header, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from mangum import Mangum
 
-from config import GROQ_API_KEY, GROQ_MODEL, PORT
+from config import CORS_ALLOWED_ORIGINS, GROQ_API_KEY, GROQ_MODEL, PORT
+from services.evaluation_queue import EvaluationQueueUnavailable, enqueue_evaluation_job
+from services.s3_storage import (
+    InvalidResumeFile, S3ObjectNotFound, S3StorageError,
+    delete_resume_file, upload_resume_file,
+)
 from database import (
     DatabaseUnavailable, get_db,
     create_user, authenticate_user, get_user_by_token,
     save_chat_message, get_chat_history, clear_chat_history,
     save_full_evaluation, get_user_evaluations, get_user_evaluation_detail,
     delete_user_evaluation, get_resume_session, save_resume_session,
+    create_evaluation_job as persist_evaluation_job, get_evaluation_job,
+    update_evaluation_job, get_evaluation_job_by_idempotency_key,
     update_evaluation_context
 )
 from services.groq_service import is_groq_configured
@@ -50,25 +59,13 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# Enable CORS for local Vite development and deployed Vercel frontends
-ALLOWED_ORIGINS = [
-    "https://devlyzer-ai.vercel.app",
-    "https://careerlens-ai.vercel.app",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "*"
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origins=list(CORS_ALLOWED_ORIGINS),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
+    expose_headers=["Content-Length"],
 )
 
 @app.exception_handler(DatabaseUnavailable)
@@ -76,23 +73,70 @@ async def database_unavailable_handler(request: Request, exc: DatabaseUnavailabl
     logger.error("Database unavailable while handling %s", request.url.path)
     return JSONResponse(status_code=503, content={"detail": "Database service is temporarily unavailable."})
 
+@app.exception_handler(S3ObjectNotFound)
+async def s3_object_not_found_handler(request: Request, exc: S3ObjectNotFound):
+    return JSONResponse(status_code=404, content={"detail": "Resume file was not found."})
+
+@app.exception_handler(S3StorageError)
+async def s3_storage_error_handler(request: Request, exc: S3StorageError):
+    logger.error("Resume storage unavailable while handling %s", request.url.path)
+    return JSONResponse(status_code=503, content={"detail": "Resume storage is temporarily unavailable."})
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Global unhandled exception on {request.url.path}: {exc}", exc_info=True)
-    origin = request.headers.get("origin", "*")
+    logger.error("Unhandled application error on %s (%s).", request.url.path, type(exc).__name__)
     return JSONResponse(
         status_code=500,
-        content={"detail": f"Backend processing error: {str(exc)}"},
-        headers={
-            "Access-Control-Allow-Origin": origin if origin else "*",
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Allow-Methods": "*",
-            "Access-Control-Allow-Headers": "*",
-        }
+        content={"detail": "Backend processing error."},
     )
 
-UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR = (
+    Path("/tmp/careerlens-uploads")
+    if os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+    else Path(__file__).resolve().parent / "uploads"
+)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MAX_RESUME_BYTES = 6 * 1024 * 1024
+
+async def _persist_resume_upload(file: UploadFile, session_id: str, owner_id: str):
+    """Parse, upload, and persist owner-scoped resume metadata with compensation."""
+    if getattr(file, "size", None) is not None and file.size > MAX_RESUME_BYTES:
+        raise HTTPException(status_code=413, detail="Resume exceeds the 6 MiB upload limit.")
+    file_bytes = await file.read(MAX_RESUME_BYTES + 1)
+    if len(file_bytes) > MAX_RESUME_BYTES:
+        raise HTTPException(status_code=413, detail="Resume exceeds the 6 MiB upload limit.")
+    try:
+        raw_text, metadata = extract_text_from_pdf(file_bytes)
+    except Exception:
+        logger.warning("Resume PDF parsing failed.")
+        raise HTTPException(status_code=422, detail="Unable to process this PDF.") from None
+    if not raw_text or metadata.get("is_scanned_or_empty"):
+        raise HTTPException(
+            status_code=422,
+            detail="Unable to extract text from this PDF. Please ensure it is not a scanned image without OCR.",
+        )
+
+    stored = upload_resume_file(owner_id, file_bytes, file.content_type)
+    try:
+        save_resume_session(
+            user_id=owner_id,
+            session_id=session_id,
+            raw_text=raw_text,
+            metadata=metadata,
+            filename=file.filename or "resume.pdf",
+            s3_object_key=stored["object_key"],
+            content_type=stored["content_type"],
+            file_size=stored["file_size"],
+            uploaded_at=stored["uploaded_at"],
+        )
+    except Exception:
+        try:
+            delete_resume_file(stored["object_key"])
+        except S3StorageError:
+            logger.error("Resume object cleanup failed after metadata persistence error.")
+        raise
+    return raw_text, metadata, stored
+
 
 def _authenticated_user(authorization: Optional[str], required: bool = False):
     token = None
@@ -225,29 +269,12 @@ async def upload_resume(
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
     session_id = str(uuid.uuid4())
-    file_path = UPLOAD_DIR / f"{session_id}.pdf"
+    owner_id = _resume_owner(session_id, authorization)
+    if file.content_type not in (None, "", "application/pdf", "application/octet-stream"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
     try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        extracted_text, metadata = extract_text_from_pdf(str(file_path))
-        
-        if not extracted_text or metadata.get("is_scanned_or_empty"):
-            raise HTTPException(
-                status_code=422,
-                detail="Unable to extract text from this PDF. Please ensure it is not a scanned image without OCR."
-            )
-
-        owner_id = _resume_owner(session_id, authorization)
-        save_resume_session(
-            user_id=owner_id,
-            session_id=session_id,
-            raw_text=extracted_text,
-            metadata=metadata,
-            filename=file.filename,
-        )
-
+        extracted_text, metadata, _stored = await _persist_resume_upload(file, session_id, owner_id)
         return {
             "session_id": session_id,
             "filename": file.filename,
@@ -255,14 +282,8 @@ async def upload_resume(
             "preview_text": extracted_text[:350] + ("..." if len(extracted_text) > 350 else ""),
             "message": "Resume uploaded and text extracted successfully."
         }
-    except HTTPException:
-        raise
-    except DatabaseUnavailable:
-        raise
-    except Exception as e:
-        logger.error(f"Error processing upload: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
-
+    except InvalidResumeFile as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
 
 @app.post("/api/resume/analyze")
 async def analyze_resume(
@@ -375,59 +396,19 @@ class UnifiedEvalRequest(BaseModel):
     github_username: Optional[str] = None
     leetcode_username: Optional[str] = None
 
-@app.post("/api/evaluate/unified")
-async def evaluate_unified_profile(
-    session_id: Optional[str] = Form(None),
-    github_username: Optional[str] = Form(None),
-    leetcode_username: Optional[str] = Form(None),
-    target_role: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None),
-    jd_text: Optional[str] = Form(None),
-    jd_file: Optional[UploadFile] = File(None),
-    authorization: Optional[str] = Header(None)
+async def _evaluate_profile_core(
+    *,
+    owner_id: str,
+    current_session_id: str,
+    github_username: Optional[str],
+    leetcode_username: Optional[str],
+    target_role: Optional[str],
+    raw_text: str,
+    jd_text: Optional[str] = None,
+    jd_file: Optional[UploadFile] = None,
+    evaluation_id: Optional[str] = None,
 ):
-    """
-    THE 360° TALENT EVALUATION:
-    Combines Resume ATS Extraction + GitHub Engineering Metrics + LeetCode DSA Signals
-    with the Cross-Verification Engine, Hybrid Job Matcher, and Custom JD Matcher.
-    """
-    if not github_username or not github_username.strip():
-        raise HTTPException(status_code=400, detail="GitHub username is mandatory for developer signal verification.")
-    if not leetcode_username or not leetcode_username.strip():
-        raise HTTPException(status_code=400, detail="LeetCode username is mandatory for DSA readiness assessment.")
-
-    raw_text = ""
-    metadata = {}
-    current_session_id = session_id or str(uuid.uuid4())
-    owner_id = _resume_owner(current_session_id, authorization)
-
-    # 1. Process Resume if provided
-    if file and getattr(file, "filename", None):
-        file_path = UPLOAD_DIR / f"{current_session_id}.pdf"
-        try:
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            raw_text, metadata = extract_text_from_pdf(str(file_path))
-            if raw_text:
-                save_resume_session(
-                    user_id=owner_id,
-                    session_id=current_session_id,
-                    raw_text=raw_text,
-                    metadata=metadata,
-                    filename=file.filename,
-                )
-        except DatabaseUnavailable:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to extract text from PDF: {e}")
-            raw_text = ""
-            metadata = {"error": str(e)}
-    elif session_id:
-        resume_session = get_resume_session(session_id, owner_id)
-        if not resume_session:
-            raise HTTPException(status_code=404, detail="Resume session not found.")
-        raw_text = resume_session.get("raw_text", "")
-        metadata = resume_session.get("metadata", {})
+    """Shared evaluation computation used by the sync route and SQS worker."""
 
     # Extract resume profile if text exists
     resume_analysis = {}
@@ -538,7 +519,7 @@ async def evaluate_unified_profile(
         holistic_score = dev_overall
 
     response_payload = {
-        "evaluation_id": str(uuid.uuid4()),
+        "evaluation_id": evaluation_id or str(uuid.uuid4()),
         "created_at": datetime.utcnow().isoformat(),
         "resume_session_id": current_session_id if raw_text else None,
         "candidate_info": resume_analysis.get("candidate_info", {
@@ -618,11 +599,160 @@ async def evaluate_unified_profile(
         logger.error(f"Error generating roadmap: {e}")
         response_payload["roadmap"] = None
 
-    save_full_evaluation(user_id=owner_id, record=response_payload)
-
-
     return response_payload
 
+
+@app.post("/api/evaluate/unified")
+async def evaluate_unified_profile(
+    session_id: Optional[str] = Form(None),
+    github_username: Optional[str] = Form(None),
+    leetcode_username: Optional[str] = Form(None),
+    target_role: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    jd_text: Optional[str] = Form(None),
+    jd_file: Optional[UploadFile] = File(None),
+    authorization: Optional[str] = Header(None)
+):
+    """
+    THE 360° TALENT EVALUATION:
+    Combines Resume ATS Extraction + GitHub Engineering Metrics + LeetCode DSA Signals
+    with the Cross-Verification Engine, Hybrid Job Matcher, and Custom JD Matcher.
+    """
+    if not github_username or not github_username.strip():
+        raise HTTPException(status_code=400, detail="GitHub username is mandatory for developer signal verification.")
+    if not leetcode_username or not leetcode_username.strip():
+        raise HTTPException(status_code=400, detail="LeetCode username is mandatory for DSA readiness assessment.")
+
+    raw_text = ""
+    metadata = {}
+    current_session_id = session_id or str(uuid.uuid4())
+    owner_id = _resume_owner(current_session_id, authorization)
+
+    # 1. Process Resume if provided
+    if file and getattr(file, "filename", None):
+        if not file.filename.lower().endswith(".pdf") or file.content_type not in (None, "", "application/pdf", "application/octet-stream"):
+            raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+        try:
+            raw_text, metadata, _stored = await _persist_resume_upload(file, current_session_id, owner_id)
+        except InvalidResumeFile as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+    elif session_id:
+        resume_session = get_resume_session(session_id, owner_id)
+        if not resume_session:
+            raise HTTPException(status_code=404, detail="Resume session not found.")
+        raw_text = resume_session.get("raw_text", "")
+        metadata = resume_session.get("metadata", {})
+
+    response_payload = await _evaluate_profile_core(
+        owner_id=owner_id,
+        current_session_id=current_session_id,
+        github_username=github_username,
+        leetcode_username=leetcode_username,
+        target_role=target_role,
+        raw_text=raw_text,
+        jd_text=jd_text,
+        jd_file=jd_file,
+    )
+    save_full_evaluation(user_id=owner_id, record=response_payload)
+    return response_payload
+
+
+
+class EvaluationJobRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    github_username: str = Field(min_length=1, max_length=100)
+    leetcode_username: str = Field(min_length=1, max_length=100)
+    target_role: Optional[str] = Field(default=None, max_length=200)
+    jd_text: Optional[str] = Field(default=None, max_length=100000)
+
+
+@app.post("/api/evaluations/jobs", status_code=202)
+def submit_evaluation_job(
+    payload: EvaluationJobRequest,
+    authorization: Optional[str] = Header(None),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    """Persist and queue an evaluation without placing resume bytes on SQS."""
+    user = _authenticated_user(authorization, required=True)
+    if idempotency_key is not None and not 1 <= len(idempotency_key.strip()) <= 128:
+        raise HTTPException(status_code=400, detail="Idempotency-Key must contain 1 to 128 characters.")
+    hashed_idempotency_key = None
+    if idempotency_key:
+        key_material = "{}:{}".format(user["id"], idempotency_key.strip())
+        hashed_idempotency_key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+        existing = get_evaluation_job_by_idempotency_key(user["id"], hashed_idempotency_key)
+        if existing:
+            existing_id = existing["id"]
+            return {
+                "job_id": existing_id,
+                "evaluation_id": existing_id,
+                "status": existing.get("status"),
+                "status_url": f"/api/evaluations/jobs/{existing_id}",
+                "result_url": f"/api/evaluations/{existing_id}",
+            }
+    github_username = payload.github_username.strip()
+    leetcode_username = payload.leetcode_username.strip()
+    if not github_username or not leetcode_username:
+        raise HTTPException(status_code=400, detail="GitHub and LeetCode usernames are required.")
+    resume = get_resume_session(payload.session_id, user["id"])
+    if not resume or not resume.get("s3_object_key"):
+        raise HTTPException(status_code=404, detail="Resume session not found.")
+
+    job_id = str(uuid.uuid4())
+    job = {
+        "id": job_id,
+        "user_id": user["id"],
+        "resume_session_id": payload.session_id,
+        "github_username": github_username,
+        "leetcode_username": leetcode_username,
+        "target_role": payload.target_role.strip() if payload.target_role else None,
+        "jd_text": payload.jd_text.strip() if payload.jd_text else None,
+        "status": "pending",
+        "attempts": 0,
+        "failure_code": None,
+        "idempotency_key": hashed_idempotency_key,
+    }
+    persisted_job = persist_evaluation_job(job)
+    job_id = persisted_job["id"]
+    try:
+        enqueue_evaluation_job(job_id)
+    except EvaluationQueueUnavailable:
+        update_evaluation_job(
+            job_id, {"status": "failed", "failure_code": "queue_unavailable"}, user_id=user["id"]
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Evaluation service is temporarily unavailable.",
+        ) from None
+
+    return {
+        "job_id": job_id,
+        "evaluation_id": job_id,
+        "status": "pending",
+        "status_url": f"/api/evaluations/jobs/{job_id}",
+        "result_url": f"/api/evaluations/{job_id}",
+    }
+
+
+@app.get("/api/evaluations/jobs/{job_id}")
+def get_evaluation_job_status(
+    job_id: str,
+    authorization: Optional[str] = Header(None),
+):
+    user = _authenticated_user(authorization, required=True)
+    job = get_evaluation_job(user["id"], job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Evaluation job not found.")
+    return {
+        "job_id": job_id,
+        "evaluation_id": job_id,
+        "status": job.get("status"),
+        "attempts": job.get("attempts", 0),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "failure_code": job.get("failure_code"),
+        "result_url": f"/api/evaluations/{job_id}",
+    }
 
 # ----------------- CUSTOM JOB DESCRIPTION MATCHING ENDPOINT -----------------
 
