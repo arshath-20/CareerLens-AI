@@ -1,9 +1,13 @@
-﻿name: Deploy CareerLens AI frontend to S3
+name: Deploy CareerLens AI frontend to S3
 
-# Production deployments are manual and gated by the GitHub production environment.
-# The previous automatic production-branch push trigger is intentionally disabled.
+# Deploy to AWS production automatically, but only after CI succeeds on main.
 on:
-  workflow_dispatch:
+  workflow_run:
+    workflows: ["CareerLens AI CI"]
+    types:
+      - completed
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -16,12 +20,14 @@ concurrency:
 jobs:
   deploy:
     name: Build and deploy frontend
-    if: ${{ github.ref == 'refs/heads/production' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - name: Checkout repository
+      - name: Checkout the exact commit validated by CI
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
